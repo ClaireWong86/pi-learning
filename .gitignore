@@ -1,0 +1,5 @@
+node_modules
+L08-assistant-ui/dist
+L07-streaming/data/*.sqlite
+L07-streaming/data/*.jsonl
+L07-streaming/data/sessions/
