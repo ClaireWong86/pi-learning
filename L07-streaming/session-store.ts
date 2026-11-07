@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 // 会话持久化：一个 threadId 对应一个 Pi 会话文件（JSONL），index.json 保存线程元数据与用户归属。
@@ -12,8 +12,26 @@ export type ThreadRecord = {
   sessionFile: string;
   title: string;
   turns: number;
+  archived?: boolean;
   createdAt: string;
   updatedAt: string;
+};
+
+export type HistoryPart =
+  | { type: "text"; text: string }
+  | {
+      type: "tool-call";
+      toolCallId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+      result?: string;
+      isError?: boolean;
+    };
+
+export type HistoryMessage = {
+  role: string;
+  text: string;
+  parts?: HistoryPart[];
 };
 
 export class ThreadAccessError extends Error {
@@ -30,17 +48,41 @@ export type OpenedThread = {
   resumed: boolean;
 };
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+function spokenText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => asRecord(part))
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => String(part.text))
+    .join("\n");
+}
+
 function textOf(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   const parts: string[] = [];
   for (const part of content) {
-    if (!part || typeof part !== "object") continue;
-    const item = part as { type?: string; text?: string; name?: string };
-    if (item.type === "text" && item.text) parts.push(item.text);
-    if (item.type === "toolCall" && item.name) parts.push(`[调用 ${item.name}]`);
+    const item = asRecord(part);
+    if (item.type === "text" && typeof item.text === "string") parts.push(item.text);
+    if (item.type === "toolCall" && typeof item.name === "string") parts.push(`[调用 ${item.name}]`);
   }
   return parts.join("\n");
+}
+
+export function conclusionOf(text: string) {
+  const index = text.indexOf("结论：");
+  if (index < 0) return text.trim();
+  return text.slice(index).trim();
+}
+
+function safeThreadId(threadId: string) {
+  if (!/^[A-Za-z0-9_-]+$/.test(threadId)) throw new ThreadAccessError(400, "线程编号不合法");
+  return threadId;
 }
 
 export class SalesSessionStore {
@@ -118,16 +160,116 @@ export class SalesSessionStore {
     this.save();
   }
 
+  rename(threadId: string, userId: string, title: string) {
+    const record = this.owned(threadId, userId);
+    record.title = title.trim().slice(0, 60);
+    record.updatedAt = new Date().toISOString();
+    this.save();
+    return record;
+  }
+
+  archive(threadId: string, userId: string, archived: boolean) {
+    const record = this.owned(threadId, userId);
+    record.archived = archived;
+    record.updatedAt = new Date().toISOString();
+    this.save();
+    return record;
+  }
+
+  remove(threadId: string, userId: string) {
+    const record = this.owned(threadId, userId);
+    this.records.delete(record.threadId);
+    this.save();
+    for (const file of [record.sessionFile, this.traceFile(record.threadId)]) {
+      const fromRoot = relative(this.dir, file);
+      if (fromRoot.startsWith("..") || fromRoot.startsWith("/")) continue;
+      if (existsSync(file)) rmSync(file, { force: true });
+    }
+  }
+
+  appendRound(threadId: string, round: unknown) {
+    const id = safeThreadId(threadId);
+    const rounds = this.readRounds(id);
+    rounds.push(round);
+    writeFileSync(this.traceFile(id), JSON.stringify(rounds));
+  }
+
+  readRounds(threadId: string): unknown[] {
+    try {
+      const raw = JSON.parse(readFileSync(this.traceFile(safeThreadId(threadId)), "utf8")) as unknown;
+      return Array.isArray(raw) ? raw : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private owned(threadId: string, userId: string) {
+    const record = this.records.get(safeThreadId(threadId));
+    if (!record) throw new ThreadAccessError(404, "线程不存在或已被清理");
+    if (record.userId !== userId) throw new ThreadAccessError(403, "这个线程属于其他用户");
+    return record;
+  }
+
+  private traceFile(threadId: string) {
+    return join(this.dir, `${threadId}.trace.json`);
+  }
+
   history(threadId: string, userId: string) {
     const { record, sessionManager } = this.open(threadId, userId);
-    const messages = sessionManager
-      .buildSessionContext()
-      .messages.map((message) => {
-        const item = message as { role?: string; content?: unknown };
-        return { role: item.role ?? "unknown", text: textOf(item.content) };
-      })
-      // userMemory 扩展注入的系统偏好不是用户说的话，不进历史回显。
-      .filter((item) => item.text && !item.text.startsWith("[系统注入的用户偏好"));
-    return { thread: record, messages };
+    const messages = historyMessages(sessionManager.buildSessionContext().messages);
+    return { thread: record, messages, rounds: this.readRounds(threadId) };
   }
+}
+
+function historyMessages(source: readonly unknown[]): HistoryMessage[] {
+  const messages: HistoryMessage[] = [];
+  let assistant: HistoryMessage | null = null;
+  const flush = () => {
+    if (!assistant) return;
+    const text = assistant.parts?.find((part) => part.type === "text");
+    assistant.text = text && text.type === "text" ? text.text : assistant.text;
+    if (assistant.text || assistant.parts?.some((part) => part.type === "tool-call")) messages.push(assistant);
+    assistant = null;
+  };
+  for (const message of source) {
+    const item = asRecord(message);
+    const role = typeof item.role === "string" ? item.role : "unknown";
+    if (role === "toolResult") {
+      const callId = String(item.toolCallId ?? "");
+      const text = textOf(item.content);
+      const part = assistant?.parts?.find((entry) => entry.type === "tool-call" && entry.toolCallId === callId);
+      if (part && part.type === "tool-call") {
+        part.result = text;
+        part.isError = item.isError === true || text.startsWith("已拦截") || text.startsWith("无法查询");
+      }
+      continue;
+    }
+    if (role === "assistant") {
+      if (!assistant) assistant = { role: "assistant", text: "", parts: [] };
+      if (Array.isArray(item.content)) {
+        for (const raw of item.content) {
+          const part = asRecord(raw);
+          if (part.type !== "toolCall") continue;
+          assistant.parts?.push({
+            type: "tool-call",
+            toolCallId: String(part.id ?? ""),
+            toolName: String(part.name ?? "query_data"),
+            args: asRecord(part.arguments),
+          });
+        }
+      }
+      const spoken = conclusionOf(spokenText(item.content));
+      if (spoken) {
+        assistant.parts?.push({ type: "text", text: spoken });
+        assistant.text = spoken;
+      }
+      continue;
+    }
+    flush();
+    const text = textOf(item.content);
+    if (!text || text.startsWith("[系统注入的用户偏好")) continue;
+    messages.push({ role, text });
+  }
+  flush();
+  return messages;
 }

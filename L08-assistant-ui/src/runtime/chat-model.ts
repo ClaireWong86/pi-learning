@@ -6,22 +6,49 @@ import type {
   ToolCallMessagePart,
 } from "@assistant-ui/react";
 import { readSse } from "./sse.ts";
-import { dispatchTrace, noteUser } from "./trace-store.ts";
+import { beginRound, dispatchTrace, noteUser } from "./trace-store.ts";
 import { userForPrompt } from "./user-bridge.ts";
 
 const IDLE_TIMEOUT_MS = 45_000;
 
-function lastUserText(messages: readonly ThreadMessage[]) {
+const leafByAssistant = new Map<string, string>();
+const forkByUser = new Map<string, string | null>();
+
+function lastUserMessage(messages: readonly ThreadMessage[]) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message?.role !== "user") continue;
-    return message.content
-      .filter((part): part is { type: "text"; text: string } => part.type === "text")
-      .map((part) => part.text)
-      .join("")
-      .trim();
+    if (message?.role === "user") return message;
   }
-  return "";
+  return undefined;
+}
+
+function previousAssistant(messages: readonly ThreadMessage[]) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role === "assistant") return message;
+  }
+  return undefined;
+}
+
+function quoteOf(message: ThreadMessage | undefined) {
+  const quote = message?.metadata?.custom?.quote;
+  if (!quote || typeof quote !== "object" || !("text" in quote)) return "";
+  return typeof quote.text === "string" ? quote.text.trim() : "";
+}
+
+function messageText(message: ThreadMessage | undefined) {
+  if (!message) return "";
+  return message.content
+    .filter((part): part is { type: "text"; text: string } => part.type === "text")
+    .map((part) => part.text)
+    .join("")
+    .trim();
+}
+
+function outgoingText(text: string, quote: string) {
+  if (quote && text) return `${text}\n（引用结论：${quote}）`;
+  if (quote) return `这段「${quote}」是怎么算出来的？请对照查询结果说明。`;
+  return text;
 }
 
 function snapshot(reasoning: string, tools: Map<string, ToolCallMessagePart>, text: string): ThreadAssistantMessagePart[] {
@@ -38,11 +65,19 @@ export function createSalesChatModel(
   onThreadId: (threadId: string) => void,
 ): ChatModelAdapter {
   return {
-    async *run({ messages, abortSignal, unstable_threadId }): AsyncGenerator<ChatModelRunResult, void> {
-      const message = lastUserText(messages);
+    async *run({ messages, abortSignal, unstable_threadId, unstable_assistantMessageId }): AsyncGenerator<ChatModelRunResult, void> {
+      const userMessage = lastUserMessage(messages);
+      const quote = quoteOf(userMessage);
+      const message = outgoingText(messageText(userMessage), quote);
       const threadFromRun = unstable_threadId && !unstable_threadId.startsWith("__LOCALID_") ? unstable_threadId : "";
       const threadId = threadFromRun || getThreadId() || crypto.randomUUID();
       if (threadId !== getThreadId()) onThreadId(threadId);
+      const assistantId = unstable_assistantMessageId ?? "";
+      const prior = previousAssistant(messages);
+      beginRound(assistantId, prior?.id ?? null);
+      const continueFrom = prior ? leafByAssistant.get(`${threadId}:${prior.id}`) : undefined;
+      const regenerate = !continueFrom && userMessage ? forkByUser.has(`${threadId}:${userMessage.id}`) : false;
+      const forkFrom = regenerate && userMessage ? forkByUser.get(`${threadId}:${userMessage.id}`) : undefined;
       if (!message) {
         yield { status: { type: "incomplete", reason: "error", error: "message 不能为空" } };
         return;
@@ -74,7 +109,13 @@ export function createSalesChatModel(
         const response = await fetch("/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message, userId, threadId }),
+          body: JSON.stringify({
+            message,
+            userId,
+            threadId,
+            ...(continueFrom ? { continueFrom } : {}),
+            ...(regenerate ? { regenerate: true, forkFrom: forkFrom ?? null } : {}),
+          }),
           signal: controller.signal,
         });
 
@@ -134,6 +175,13 @@ export function createSalesChatModel(
             event.type === "trace_end"
           ) {
             if (event.type === "trace_start" && typeof event.threadId === "string") onThreadId(event.threadId);
+            if (event.type === "trace_end") {
+              const leafId = typeof event.leafId === "string" ? event.leafId : "";
+              if (assistantId && leafId) leafByAssistant.set(`${threadId}:${assistantId}`, leafId);
+              if (userMessage && "forkPoint" in event) {
+                forkByUser.set(`${threadId}:${userMessage.id}`, typeof event.forkPoint === "string" ? event.forkPoint : null);
+              }
+            }
             dispatchTrace(event);
           } else if (event.type === "done") {
             return;

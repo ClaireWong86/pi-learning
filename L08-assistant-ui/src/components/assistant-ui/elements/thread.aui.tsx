@@ -8,7 +8,7 @@ import {
 import { File, getFileHref } from "@/components/assistant-ui/elements/file";
 import { ThreadFollowupSuggestions } from "@/components/assistant-ui/elements/follow-up-suggestions.aui";
 import { Image } from "@/components/assistant-ui/elements/image";
-import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
+import { ConclusionText } from "@/components/ConclusionText";
 import {
   Reasoning,
   ReasoningContent,
@@ -36,8 +36,10 @@ import {
   ErrorPrimitive,
   groupPartByType,
   MessagePrimitive,
+  SelectionToolbarPrimitive,
   SuggestionPrimitive,
   ThreadPrimitive,
+  useMessageQuote,
   type FileMessagePartComponent,
   type ImageMessagePartComponent,
   type TextMessagePartComponent,
@@ -66,12 +68,14 @@ import {
 import {
   createContext,
   useContext,
+  useEffect,
   useLayoutEffect,
   useRef,
   type ComponentType,
   type FC,
   type PropsWithChildren,
 } from "react";
+import { showBranch } from "@/runtime/trace-store";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -201,9 +205,21 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
 }) => {
   const { Welcome = ThreadWelcome } = useContext(ThreadComponentsContext);
 
+  useEffect(() => {
+    const viewport = document.querySelector("[data-slot=aui_thread-viewport]");
+    if (!(viewport instanceof HTMLElement)) return;
+    const dismissQuote = () => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) return;
+      selection.removeAllRanges();
+    };
+    viewport.addEventListener("scroll", dismissQuote, { passive: true });
+    return () => viewport.removeEventListener("scroll", dismissQuote);
+  }, []);
+
   return (
     <ThreadPrimitive.Root
-      className="aui-root aui-thread-root bg-background @container flex h-full flex-col"
+      className="aui-root aui-thread-root bg-background @container flex h-full min-h-0 w-full flex-col"
       style={{
         ["--thread-max-width" as string]: "44rem",
         ["--composer-bg" as string]:
@@ -212,10 +228,16 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
         ["--composer-padding" as string]: "8px",
       }}
     >
+      <BranchTraceSync />
+      <SelectionToolbarPrimitive.Root className="bg-popover text-popover-foreground z-50 flex items-center rounded-lg border px-1 py-1 shadow-md">
+        <SelectionToolbarPrimitive.Quote className="hover:bg-muted rounded-md px-2 py-1 text-xs">
+          引用并追问
+        </SelectionToolbarPrimitive.Quote>
+      </SelectionToolbarPrimitive.Root>
       <ThreadPrimitive.Viewport
         turnAnchor="top"
         data-slot="aui_thread-viewport"
-        className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll scroll-smooth"
+        className="relative flex min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto overscroll-y-contain [overflow-anchor:none]"
       >
         <div
           className={cn(
@@ -466,7 +488,13 @@ const ThreadSuggestionItem: FC = () => {
 const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
-      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-foreground/10 focus-within:border-foreground/25 data-[dragging=true]:border-ring flex w-full cursor-text flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) transition-[border-color] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))]" />}><ComposerAttachments /><ComposerPrimitive.Input
+      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-foreground/10 focus-within:border-foreground/25 data-[dragging=true]:border-ring flex w-full cursor-text flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) transition-[border-color] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))]" />}><ComposerAttachments /><ComposerPrimitive.Quote className="bg-background mx-1 flex items-start gap-2 rounded-lg border px-2.5 py-1.5 text-xs">
+                      <span className="text-muted-foreground shrink-0">引用</span>
+                      <ComposerPrimitive.QuoteText className="line-clamp-2 min-w-0 flex-1" />
+                      <ComposerPrimitive.QuoteDismiss className="text-muted-foreground shrink-0" aria-label="取消引用">
+                        取消
+                      </ComposerPrimitive.QuoteDismiss>
+                    </ComposerPrimitive.Quote><ComposerPrimitive.Input
                       placeholder="Send a message..."
                       className="aui-composer-input caret-primary placeholder:text-muted-foreground/60 max-h-48 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base leading-6 outline-none"
                       rows={1}
@@ -560,7 +588,7 @@ const AssistantMessage: FC = () => {
     <MessagePrimitive.Root
       data-slot="aui_assistant-message-root"
       data-role="assistant"
-      className="fade-in slide-in-from-bottom-1 animate-in relative -mb-7.5 pb-7.5 duration-150 [contain-intrinsic-size:auto_200px] [content-visibility:auto]"
+      className="fade-in slide-in-from-bottom-1 animate-in relative -mb-7.5 pb-7.5 duration-150"
     >
       <div
         data-slot="aui_assistant-message-content"
@@ -608,7 +636,7 @@ const AssistantMessage: FC = () => {
                 );
               }
               case "text":
-                return <MarkdownText />;
+                return <ConclusionText />;
               case "reasoning":
                 return <Reasoning {...part} />;
               case "tool-call":
@@ -672,7 +700,7 @@ const AssistantActionBar: FC = () => {
         <ActionBarPrimitive.FeedbackPositive render={<TooltipIconButton tooltip="Helpful" className="data-[submitted=true]:bg-accent data-[submitted=true]:text-accent-foreground" />}><ThumbsUpIcon /></ActionBarPrimitive.FeedbackPositive>
         <ActionBarPrimitive.FeedbackNegative render={<TooltipIconButton tooltip="Not helpful" className="data-[submitted=true]:bg-accent data-[submitted=true]:text-accent-foreground" />}><ThumbsDownIcon /></ActionBarPrimitive.FeedbackNegative>
       </AuiIf>
-      <ActionBarPrimitive.Reload render={<TooltipIconButton tooltip="Refresh" />}><RefreshCwIcon /></ActionBarPrimitive.Reload>
+      <ActionBarPrimitive.Reload render={<TooltipIconButton tooltip="再生成一版" />}><RefreshCwIcon /></ActionBarPrimitive.Reload>
       <ActionBarMorePrimitive.Root>
         <ActionBarMorePrimitive.Trigger render={<TooltipIconButton tooltip="More" className="data-[state=open]:bg-accent" />}><MoreHorizontalIcon /></ActionBarMorePrimitive.Trigger>
         <ActionBarMorePrimitive.Content
@@ -716,17 +744,39 @@ const UserImagePart: ImageMessagePartComponent = (part) => (
   </div>
 );
 
+const BranchTraceSync: FC = () => {
+  const branchId = useAuiState((state) => {
+    const messages = state.thread.messages;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.role === "assistant") return message.id;
+    }
+    return null;
+  });
+  useEffect(() => {
+    showBranch(branchId);
+  }, [branchId]);
+  return null;
+};
+
+const UserQuote: FC = () => {
+  const quote = useMessageQuote();
+  if (!quote?.text) return null;
+  return <blockquote className="border-foreground/20 text-muted-foreground mb-1 border-s-2 ps-2 text-xs">引用：{quote.text}</blockquote>;
+};
+
 const UserMessage: FC = () => {
   return (
     <MessagePrimitive.Root
       data-slot="aui_user-message-root"
-      className="fade-in slide-in-from-bottom-1 animate-in grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [contain-intrinsic-size:auto_200px] [content-visibility:auto] [&:where(>*)]:col-start-2"
+      className="fade-in slide-in-from-bottom-1 animate-in grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 duration-150 [&:where(>*)]:col-start-2"
       data-role="user"
     >
       <UserMessageAttachments />
 
       <div className="aui-user-message-content-wrapper relative col-start-2 min-w-0">
         <div className="aui-user-message-content peer bg-muted text-foreground rounded-(--composer-radius) px-4 py-2 wrap-break-word empty:hidden">
+          <UserQuote />
           <MessagePrimitive.Parts
             components={{ File: UserFilePart, Image: UserImagePart }}
           />
@@ -791,11 +841,11 @@ const BranchPicker: FC<BranchPickerPrimitive.Root.Props> = ({
       )}
       {...rest}
     >
-      <BranchPickerPrimitive.Previous render={<TooltipIconButton tooltip="Previous" />}><ChevronLeftIcon /></BranchPickerPrimitive.Previous>
+      <BranchPickerPrimitive.Previous render={<TooltipIconButton tooltip="上一版" />}><ChevronLeftIcon /></BranchPickerPrimitive.Previous>
       <span className="aui-branch-picker-state font-medium">
-        <BranchPickerPrimitive.Number /> / <BranchPickerPrimitive.Count />
+        第 <BranchPickerPrimitive.Number /> / <BranchPickerPrimitive.Count /> 版
       </span>
-      <BranchPickerPrimitive.Next render={<TooltipIconButton tooltip="Next" />}><ChevronRightIcon /></BranchPickerPrimitive.Next>
+      <BranchPickerPrimitive.Next render={<TooltipIconButton tooltip="下一版" />}><ChevronRightIcon /></BranchPickerPrimitive.Next>
     </BranchPickerPrimitive.Root>
   );
 };

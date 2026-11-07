@@ -15,6 +15,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryDataCard } from "./components/QueryDataCard.tsx";
 import { TraceRail } from "./components/TraceRail.tsx";
 import { createSalesChatModel } from "./runtime/chat-model.ts";
+import { salesSuggestionAdapter } from "./runtime/follow-ups.ts";
 import { createThreadListAdapter } from "./runtime/thread-list.ts";
 import { noteUser, showThread, useTrace } from "./runtime/trace-store.ts";
 import { bindChatUser, chooseChatUser } from "./runtime/user-bridge.ts";
@@ -60,7 +61,7 @@ function Shell({
   onUserId: (id: string) => void;
 }) {
   const [health, setHealth] = useState("正在连接只读销售库…");
-  const [traceOpen, setTraceOpen] = useState(false);
+  const [traceOpen, setTraceOpen] = useState(true);
   const trace = useTrace();
   const isRunning = useAuiState((state) => state.thread.isRunning);
 
@@ -79,8 +80,8 @@ function Shell({
 
   return (
     <TooltipProvider>
-      <div className="bg-background text-foreground flex h-dvh">
-        <aside className="bg-muted/40 flex w-64 shrink-0 flex-col border-r">
+      <div className="bg-background text-foreground flex h-dvh overflow-hidden">
+        <aside className="bg-muted/40 flex h-full w-64 shrink-0 flex-col border-r">
           <div className="flex h-12 items-center px-4 text-sm font-medium">assistant-ui</div>
           <div className="flex min-h-0 flex-1 flex-col gap-3 px-3">
             <ThreadList />
@@ -103,18 +104,20 @@ function Shell({
           </div>
           <p className="text-muted-foreground px-4 py-3 text-xs leading-5">{health}</p>
         </aside>
-        <div className="flex min-w-0 flex-1 flex-col">
-          <header className="flex h-12 items-center border-b px-4 text-sm">
-            <span>New chat</span>
+        <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">
+          <header className="flex h-12 shrink-0 items-center gap-3 border-b px-4 text-sm">
+            <span className="shrink-0">{userId === "u001" ? "王小姐 · 仅华东" : "李先生 · 全部地区"}</span>
             <button
               type="button"
-              className="text-muted-foreground hover:text-foreground ml-auto text-xs"
+              className="text-muted-foreground hover:text-foreground ml-auto shrink-0 text-xs"
               onClick={() => setTraceOpen((open) => !open)}
             >
-              轨迹
+              {traceOpen ? "收起记录" : "权限 · 护栏 · 审计 · 轨迹"}
             </button>
           </header>
-          <Thread components={{ ComposerExtra: ModelChip }} />
+          <div className="min-h-0 flex-1">
+            <Thread components={{ ComposerExtra: ModelChip }} />
+          </div>
         </div>
         {traceOpen ? <TraceRail /> : null}
       </div>
@@ -145,7 +148,7 @@ export function App() {
   const runtime = useRemoteThreadListRuntime({
     adapter: listAdapter,
     runtimeHook: function useSalesModel() {
-      return useLocalRuntime(chatModel);
+      return useLocalRuntime(chatModel, { adapters: { suggestion: salesSuggestionAdapter } });
     },
     onThreadIdChange: (threadId) => {
       if (!threadId) return;

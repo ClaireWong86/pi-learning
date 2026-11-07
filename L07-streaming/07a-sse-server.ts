@@ -58,19 +58,121 @@ app.get("/api/threads", (req: Request, res: Response) => {
   const threads = sessionStore.list(user.id).map(({ sessionFile: _file, ...rest }) => rest);
   res.json({ threads });
 });
+function userFrom(value: unknown) {
+  return resolveUser(typeof value === "string" ? value : "u002");
+}
+
+function publicThread(record: { sessionFile: string }) {
+  const { sessionFile: _file, ...rest } = record;
+  return rest;
+}
+
 app.get("/api/threads/:threadId/history", (req: Request, res: Response) => {
-  const user = resolveUser(typeof req.query.userId === "string" ? req.query.userId : "u002");
+  const user = userFrom(req.query.userId);
   if (!user) return res.status(400).json({ error: "未知用户" });
   try {
-    const { thread, messages } = sessionStore.history(String(req.params.threadId), user.id);
-    const { sessionFile: _file, ...rest } = thread;
-    res.json({ thread: rest, messages });
+    const { thread, messages, rounds } = sessionStore.history(String(req.params.threadId), user.id);
+    res.json({ thread: publicThread(thread), messages, rounds });
+  } catch (error) {
+    if (error instanceof ThreadAccessError) return res.status(error.status).json({ error: error.message });
+    throw error;
+  }
+});
+
+app.patch("/api/threads/:threadId", (req: Request, res: Response) => {
+  const user = userFrom(req.body?.userId);
+  const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
+  if (!user) return res.status(400).json({ error: "未知用户" });
+  if (!title) return res.status(400).json({ error: "标题不能为空" });
+  try {
+    const thread = sessionStore.rename(String(req.params.threadId), user.id, title);
+    res.json({ thread: publicThread(thread) });
+  } catch (error) {
+    if (error instanceof ThreadAccessError) return res.status(error.status).json({ error: error.message });
+    throw error;
+  }
+});
+
+app.post("/api/threads/:threadId/archive", (req: Request, res: Response) => {
+  const user = userFrom(req.body?.userId);
+  if (!user) return res.status(400).json({ error: "未知用户" });
+  try {
+    const thread = sessionStore.archive(String(req.params.threadId), user.id, true);
+    res.json({ thread: publicThread(thread) });
+  } catch (error) {
+    if (error instanceof ThreadAccessError) return res.status(error.status).json({ error: error.message });
+    throw error;
+  }
+});
+
+app.post("/api/threads/:threadId/unarchive", (req: Request, res: Response) => {
+  const user = userFrom(req.body?.userId);
+  if (!user) return res.status(400).json({ error: "未知用户" });
+  try {
+    const thread = sessionStore.archive(String(req.params.threadId), user.id, false);
+    res.json({ thread: publicThread(thread) });
+  } catch (error) {
+    if (error instanceof ThreadAccessError) return res.status(error.status).json({ error: error.message });
+    throw error;
+  }
+});
+
+app.delete("/api/threads/:threadId", async (req: Request, res: Response) => {
+  const user = userFrom(req.query.userId);
+  if (!user) return res.status(400).json({ error: "未知用户" });
+  const threadId = String(req.params.threadId);
+  try {
+    const live = liveSessions.get(threadId);
+    if (live) {
+      liveSessions.delete(threadId);
+      await live.session.abort().catch(() => undefined);
+    }
+    sessionStore.remove(threadId, user.id);
+    res.json({ ok: true });
   } catch (error) {
     if (error instanceof ThreadAccessError) return res.status(error.status).json({ error: error.message });
     throw error;
   }
 });
 app.use(express.static(join(dirname(fileURLToPath(import.meta.url)), "public")));
+
+function entryUserText(entry: { type?: string; message?: { role?: string; content?: unknown } }) {
+  if (entry.type !== "message" || entry.message?.role !== "user") return "";
+  const content = entry.message.content;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (!part || typeof part !== "object") return "";
+      const item = part as { type?: string; text?: string };
+      return item.type === "text" && typeof item.text === "string" ? item.text : "";
+    })
+    .join("")
+    .trim();
+}
+
+async function placeLeaf(session: LiveSession, target: string | null) {
+  const current = session.sessionManager.getLeafId();
+  if (target === current) return;
+  if (target === null) {
+    session.sessionManager.resetLeaf();
+    session.agent.state.messages = session.sessionManager.buildSessionContext().messages;
+    return;
+  }
+  if (!session.sessionManager.getEntry(target)) return;
+  await session.navigateTree(target);
+}
+
+async function rewindRepeatedQuestion(session: LiveSession, message: string) {
+  let lastUser: { id: string; parentId: string | null; text: string } | undefined;
+  for (const entry of session.sessionManager.getBranch()) {
+    const text = entryUserText(entry);
+    if (!text || text.startsWith("[系统注入的用户偏好")) continue;
+    lastUser = { id: entry.id, parentId: entry.parentId, text };
+  }
+  if (!lastUser || lastUser.text !== message || session.sessionManager.getLeafId() === lastUser.id) return;
+  await placeLeaf(session, lastUser.parentId);
+}
 
 app.post("/chat", async (req: Request, res: Response) => {
   const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
@@ -118,6 +220,17 @@ app.post("/chat", async (req: Request, res: Response) => {
   const threadId = record.threadId;
   if (busyThreads.has(threadId)) return res.status(429).json({ error: "这个线程正在处理上一条消息，稍等" });
   busyThreads.add(threadId);
+  const continueFrom = typeof req.body?.continueFrom === "string" ? req.body.continueFrom : "";
+  const regenerate = req.body?.regenerate === true;
+  const forkFrom = regenerate ? (typeof req.body?.forkFrom === "string" ? req.body.forkFrom : null) : undefined;
+  try {
+    if (continueFrom) await placeLeaf(session, continueFrom);
+    else if (regenerate) await placeLeaf(session, forkFrom ?? null);
+    if (!continueFrom) await rewindRepeatedQuestion(session, message);
+  } catch (error) {
+    console.error("切换会话分支失败", error instanceof Error ? error.message : error);
+  }
+  const forkPoint = session.sessionManager.getLeafId();
 
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -131,6 +244,7 @@ app.post("/chat", async (req: Request, res: Response) => {
   const turns: Array<{ index: number; startedAt: number; durationMs?: number }> = [];
   const calls: TraceCall[] = [];
   const callStarted = new Map<string, number>();
+  const audits: Array<Record<string, unknown>> = [];
 
   const send = (event: Record<string, unknown>) => {
     if (!res.writableEnded && !res.destroyed) res.write(sse(event));
@@ -156,9 +270,15 @@ app.post("/chat", async (req: Request, res: Response) => {
         if (event.blocked === true) {
           call.outcome = "blocked";
           if (typeof event.kind === "string") call.blockKind = event.kind;
+          if (typeof event.reason === "string") call.blockReason = event.reason;
         } else if (event.effective) {
           call.effective = event.effective;
+          if (event.tightened === true) call.tightened = true;
         }
+      }
+      if (event.type === "audit" && event.entry && typeof event.entry === "object") {
+        const entry = event.entry as Record<string, unknown>;
+        audits.push({ ...entry, id: typeof event.id === "string" ? event.id : undefined });
       }
       send(event);
     },
@@ -264,8 +384,26 @@ app.post("/chat", async (req: Request, res: Response) => {
     off();
     setLive(null);
     sessionStore.touch(record, message);
+    for (const call of calls) if (call.outcome === "running") call.outcome = "error";
+    const linked = linkDependencies(calls);
+    for (const audit of audits) {
+      const call = linked.find((item) => item.id === audit.id);
+      if (call) call.audit = audit;
+    }
+    const durationMs = Date.now() - startedAt;
+    sessionStore.appendRound(threadId, {
+      input: message,
+      model: modelLabel,
+      user: user.name,
+      scope: user.regions === "*" ? "全部地区" : user.regions.join("、"),
+      duration: `${(durationMs / 1000).toFixed(1)} 秒`,
+      turns: String(turns.length),
+      callCount: String(linked.length),
+      calls: linked,
+      audits,
+      done: true,
+    });
     if (!res.writableEnded) {
-      for (const call of calls) if (call.outcome === "running") call.outcome = "error";
       send({
         type: "trace_end",
         model: modelLabel,
@@ -274,9 +412,11 @@ app.post("/chat", async (req: Request, res: Response) => {
         threadId,
         resumed,
         user: { id: user.id, name: user.name },
-        durationMs: Date.now() - startedAt,
+        durationMs,
         turns,
-        calls: linkDependencies(calls),
+        calls: linked,
+        leafId: session.sessionManager.getLeafId(),
+        forkPoint,
       });
       send({ type: "done" });
       res.end();

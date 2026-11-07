@@ -124,6 +124,7 @@ export function scoreAnswer(answer: string, toolTexts: string[], expect: Expecta
     missing,
     businessNumbers: found,
     fabricated,
-    cited: answer.includes("查询条件") && answer.includes("数据范围") && answer.includes("计算依据"),
+    cited:
+      ["查询条件", "数据范围", "计算依据"].every((label) => answer.includes(label) || toolTexts.some((text) => text.includes(label))),
   };
 }

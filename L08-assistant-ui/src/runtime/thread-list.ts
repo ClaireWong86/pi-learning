@@ -8,14 +8,26 @@ import {
   type ThreadMessageLike,
 } from "@assistant-ui/react";
 import { getChatUser } from "./user-bridge.ts";
+import { hydrateThread } from "./trace-store.ts";
 
 type ThreadRow = {
   threadId: string;
   title: string;
   updatedAt: string;
+  archived?: boolean;
 };
 
-const unsupported = () => Promise.reject(new Error("当前服务端不支持改标题、归档或删除"));
+async function writeThread(threadId: string, path: string, body: Record<string, unknown>) {
+  const response = await fetch(path, {
+    method: path.endsWith(threadId) ? "PATCH" : "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ userId: getChatUser(), ...body }),
+  });
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(payload.error ?? "会话没有保存");
+  }
+}
 
 function lineTitle(messages: readonly { content?: readonly { type?: string; text?: string }[] }[]) {
   for (const message of messages) {
@@ -38,7 +50,7 @@ export function createThreadListAdapter(userId: string): RemoteThreadListAdapter
       const threads = await loadThreads(userId);
       return {
         threads: threads.map((thread) => ({
-          status: "regular" as const,
+          status: thread.archived ? ("archived" as const) : ("regular" as const),
           remoteId: thread.threadId,
           title: thread.title || undefined,
           lastMessageAt: new Date(thread.updatedAt),
@@ -53,7 +65,7 @@ export function createThreadListAdapter(userId: string): RemoteThreadListAdapter
       const threads = await loadThreads(userId);
       const thread = threads.find((item) => item.threadId === threadId);
       return {
-        status: "regular",
+        status: thread?.archived ? "archived" : "regular",
         remoteId: threadId,
         title: thread?.title || undefined,
         lastMessageAt: thread ? new Date(thread.updatedAt) : undefined,
@@ -65,9 +77,24 @@ export function createThreadListAdapter(userId: string): RemoteThreadListAdapter
         if (title) controller.appendText(title);
       });
     },
-    rename: unsupported,
-    archive: unsupported,
-    delete: unsupported,
+    async rename(remoteId, newTitle) {
+      await writeThread(remoteId, `/api/threads/${encodeURIComponent(remoteId)}`, { title: newTitle });
+    },
+    async archive(remoteId) {
+      await writeThread(remoteId, `/api/threads/${encodeURIComponent(remoteId)}/archive`, {});
+    },
+    async unarchive(remoteId) {
+      await writeThread(remoteId, `/api/threads/${encodeURIComponent(remoteId)}/unarchive`, {});
+    },
+    async delete(remoteId) {
+      const response = await fetch(`/api/threads/${encodeURIComponent(remoteId)}?userId=${encodeURIComponent(getChatUser())}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(payload.error ?? "会话没有删除");
+      }
+    },
     unstable_useAdapters: useSalesHistory,
   };
 }
@@ -84,10 +111,19 @@ function useSalesHistory(): RuntimeAdapters {
             `/api/threads/${encodeURIComponent(remoteId)}/history?userId=${encodeURIComponent(getChatUser())}`,
           );
           if (!response.ok) return { messages: [] };
-          const body = (await response.json()) as { messages?: { role?: string; text?: string }[] };
+          const body = (await response.json()) as {
+            messages?: { role?: string; text?: string; parts?: ThreadMessageLike["content"] }[];
+            rounds?: unknown[];
+          };
+          if (remoteId) hydrateThread(remoteId, body.rounds ?? []);
           const messages: ThreadMessageLike[] = [];
           for (const item of body.messages ?? []) {
-            if ((item.role !== "user" && item.role !== "assistant") || !item.text) continue;
+            if (item.role !== "user" && item.role !== "assistant") continue;
+            if (Array.isArray(item.parts) && item.parts.length > 0) {
+              messages.push({ role: item.role, content: item.parts });
+              continue;
+            }
+            if (!item.text) continue;
             messages.push({ role: item.role, content: item.text });
           }
           return ExportedMessageRepository.fromArray(messages);

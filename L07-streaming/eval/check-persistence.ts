@@ -91,11 +91,41 @@ try {
   check("线程列表能看到本线程且记了 2 轮", threads.threads.some((item) => item.threadId === threadId && item.turns === 2), JSON.stringify(threads.threads));
 
   const history = await fetch(`http://127.0.0.1:${port}/api/threads/${threadId}/history?userId=u002`);
-  const historyBody = (await history.json()) as { messages: Array<{ role: string; text: string }> };
+  const historyBody = (await history.json()) as {
+    messages: Array<{ role: string; text: string; parts?: Array<{ type: string; result?: string }> }>;
+    rounds?: unknown[];
+  };
   check("历史接口能读回两轮问答", history.ok && historyBody.messages.some((item) => item.text.includes("华南")), `${historyBody.messages?.length ?? 0} 条`);
+  const toolParts = historyBody.messages.flatMap((item) => item.parts ?? []).filter((part) => part.type === "tool-call");
+  check("历史能还原工具结果", toolParts.some((part) => (part.result ?? "").includes("查询条件")), `${toolParts.length} 次调用`);
+  check("记录栏能从磁盘读回", Array.isArray(historyBody.rounds) && historyBody.rounds.length >= 2, `${historyBody.rounds?.length ?? 0} 问`);
 
   const stolen = await fetch(`http://127.0.0.1:${port}/api/threads/${threadId}/history?userId=u001`);
   check("其他用户读不到本线程历史", stolen.status === 403, `HTTP ${stolen.status}`);
+
+  const renamed = await fetch(`http://127.0.0.1:${port}/api/threads/${threadId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ userId: "u002", title: "华东改华南" }),
+  });
+  const afterRename = (await (await fetch(`http://127.0.0.1:${port}/api/threads?userId=u002`)).json()) as {
+    threads: Array<{ threadId: string; title: string; archived?: boolean }>;
+  };
+  check("可以改标题", renamed.ok && afterRename.threads.some((item) => item.threadId === threadId && item.title === "华东改华南"));
+
+  const archived = await fetch(`http://127.0.0.1:${port}/api/threads/${threadId}/archive`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ userId: "u002" }),
+  });
+  const afterArchive = (await (await fetch(`http://127.0.0.1:${port}/api/threads?userId=u002`)).json()) as {
+    threads: Array<{ threadId: string; archived?: boolean }>;
+  };
+  check("可以归档", archived.ok && afterArchive.threads.some((item) => item.threadId === threadId && item.archived === true));
+
+  const removed = await fetch(`http://127.0.0.1:${port}/api/threads/${threadId}?userId=u002`, { method: "DELETE" });
+  const afterDelete = await fetch(`http://127.0.0.1:${port}/api/threads/${threadId}/history?userId=u002`);
+  check("可以删除", removed.ok && afterDelete.status === 404, `HTTP ${afterDelete.status}`);
 } finally {
   await stopServer(server).catch(() => {});
   rmSync(sessionDir, { recursive: true, force: true });

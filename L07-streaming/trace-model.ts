@@ -10,11 +10,14 @@ export type TraceCall = {
   effective?: unknown;
   outcome: "ok" | "error" | "blocked" | "running";
   blockKind?: string;
+  blockReason?: string;
+  tightened?: boolean;
   resultPreview?: string;
   group?: string | null;
   extremum?: Extremum | null;
   groups?: TraceGroup[] | null;
   dependsOn?: DependsOn[];
+  audit?: Record<string, unknown>;
 };
 
 const COLUMNS = ["日期", "产品", "地区", "销售额", "数量", "销售人员"] as const;

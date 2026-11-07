@@ -60,7 +60,7 @@ export function stepGuardExtension(pi: ExtensionAPI) {
       tool: "query_data",
       reason,
     });
-    live.emit({ type: "audit", entry });
+    live.emit({ type: "audit", id: event.toolCallId, entry });
     live.emit({ type: "guard", id: event.toolCallId, blocked: true, kind, reason });
     return { block: true, reason };
   });
@@ -84,7 +84,7 @@ export function limitGuardExtension(pi: ExtensionAPI) {
       tool: "query_data",
       reason: decision.error,
     });
-    live.emit({ type: "audit", entry });
+    live.emit({ type: "audit", id: event.toolCallId, entry });
     live.emit({ type: "guard", id: event.toolCallId, blocked: true, kind: "limit", reason: decision.error });
     return { block: true, reason: decision.error };
   });
@@ -108,7 +108,7 @@ export function permissionGuardExtension(pi: ExtensionAPI) {
         tool: "query_data",
         reason: mentioned,
       });
-      live.emit({ type: "audit", entry });
+      live.emit({ type: "audit", id: event.toolCallId, entry });
       live.emit({ type: "guard", id: event.toolCallId, blocked: true, kind: "permission", reason: mentioned });
       return { block: true, reason: mentioned };
     }
@@ -125,7 +125,7 @@ export function permissionGuardExtension(pi: ExtensionAPI) {
         tool: "query_data",
         reason: decision.error,
       });
-      live.emit({ type: "audit", entry });
+      live.emit({ type: "audit", id: event.toolCallId, entry });
       live.emit({ type: "guard", id: event.toolCallId, blocked: true, kind: "permission", reason: decision.error });
       return { block: true, reason: decision.error };
     }
@@ -179,7 +179,7 @@ export function auditExtension(pi: ExtensionAPI) {
       reason: event.isError ? "工具执行失败" : undefined,
     });
     console.log(`📝 [审计] ${event.toolName} ${event.isError ? "失败" : "成功"}，${cost}ms，命中 ${details?.matchedRows ?? "—"} 行`);
-    live?.emit({ type: "audit", entry });
+    live?.emit({ type: "audit", id: event.toolCallId, entry });
   });
 }
 
